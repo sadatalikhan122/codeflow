@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.2
+    ports:
+      # Secure default: only available on the server itself (or through an SSH tunnel).
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    # Ollama is reachable only over the internal Compose network.
+    # For a GPU server, configure supported GPU devices separately.
+
+volumes:
+  ollama_data:

@@ -1,0 +1,1 @@
+"""FastAPI + Ollama example application."""

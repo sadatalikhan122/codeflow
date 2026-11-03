@@ -1,0 +1,101 @@
+name: FastAPI Ollama CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fastapi-ollama-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI - Unit tests and Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run unit tests (Ollama mocked)
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate Docker Compose
+        run: docker compose config -q
+
+      - name: Build Docker image
+        run: docker build -t fastapi-ollama-chatbot:ci .
+
+  cd:
+    name: CD - Deploy to Ubuntu VPS / EC2
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure secure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_HOST" && test -n "$DEPLOY_USER"
+          test -n "$SSH_PRIVATE_KEY" && test -n "$SSH_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Create deployment directory on server
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p "$HOME/fastapi-ollama-cicd"'
+
+      - name: Upload new source files
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' --exclude='.github/' --exclude='.venv/' \
+            --exclude='__pycache__/' --exclude='.env' \
+            -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:fastapi-ollama-cicd/"
+
+      - name: Start / update containers and ensure model exists
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'set -eu
+              cd "$HOME/fastapi-ollama-cicd"
+              docker compose up -d --build
+              if ! docker compose exec -T ollama ollama list | grep -q "^llama3.2"; then
+                docker compose exec -T ollama ollama pull llama3.2
+              fi
+              for attempt in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1:8000/health; then
+                  echo "Deployment healthy"
+                  exit 0
+                fi
+                sleep 2
+              done
+              docker compose ps
+              echo "Deployment health check failed" >&2
+              exit 1'
